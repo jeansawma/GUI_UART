@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uart-studio"
+version = "1.0.0"
+description = "Python desktop successor to the MATLAB GUIDE UART control and acquisition tools"
+requires-python = ">=3.10"
+dependencies = [
+  "PySide6-Essentials>=6.7,<7",
+  "pyqtgraph>=0.13.7,<0.15",
+  "pyserial>=3.5,<4",
+  "numpy>=1.25,<3",
+  "scipy>=1.11,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+uart-studio = "uart_gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["uart_gui*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
