@@ -6,6 +6,23 @@ A Python replacement for the supplied MATLAB GUIDE UART interface, built with Qt
 
 ## Run
 
+### Windows: double-click launcher
+
+Extract the project ZIP, then double-click **`run.bat`** in the `GUI_UART-main`
+folder. Install Python 3.10 or newer first if it is not already installed.
+The launcher creates a local `.venv`, installs missing application dependencies
+on the first run, and starts the app. Internet access is needed to install
+packages. Subsequent launches reuse the environment. Any errors stay visible
+in the terminal window.
+
+To start with simulated data, run this from Command Prompt in the project folder:
+
+```bat
+run.bat --demo
+```
+
+### Manual installation
+
 Use Python 3.10 or newer:
 
 ```bash
