@@ -1,4 +1,4 @@
-"""Convenience launcher; equivalent to python -m uart_gui."""
+"""Launch JS; equivalent to python -m uart_gui."""
 from uart_gui.app import main
 
 if __name__ == "__main__":

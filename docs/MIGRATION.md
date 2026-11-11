@@ -1,6 +1,8 @@
-# MATLAB → Python migration
+# MATLAB → JS migration
 
-The Python application consolidates the original GUIDE windows into a Qt desktop interface. MATLAB is not needed to run it. Original `.m` and `.fig` uploads remain in `legacy/matlab` for reference; the Python application does not execute those files.
+JS consolidates the original GUIDE windows into a Python Qt desktop interface. MATLAB is not needed to run it. Original `.m` and `.fig` uploads remain in `legacy/matlab` for reference; the Python application does not execute those files.
+
+The application name is JS. Repository `jeansawma/GUI_UART`, Python package `uart_gui`, and the original MATLAB filenames are retained for compatibility. Both `js` and the earlier `uart-studio` installed launch commands are supported.
 
 ## Feature and address map
 
@@ -46,7 +48,19 @@ The decoder buffers incomplete packets across reads and consumes payloads by len
 
 The default device sample period is 0.0001 seconds; the original plot step is 0.01 seconds and display window is 20 seconds. Incoming device timing is used for acquired plots. Plot subscriptions preserve the original maximum of 15 channels and disabled-slot value `255`.
 
-Serial reads and paced command writes run outside the GUI thread. Rapid selection changes replace superseded routing jobs; samples received while routes are being updated are discarded to avoid assigning them to the wrong signal. STOP cancels pending writes, sends the original three zero commands, and resends the latest signal routing if needed. The protocol has no acknowledgement, so a completed write means bytes were sent, rather than confirmation that firmware applied them. STOP is a software command, not a hardware emergency stop.
+Serial reads and command writes run outside the GUI thread. Signal-routing commands are sent without the delays used for numeric **Write all** batches, matching `Plot_Fill_UART.m`. Routing completes after the serial output queue drains, and an ordered receive boundary separates old-route samples from the new selection. Rapid selection changes replace superseded routing jobs; samples received before that boundary are discarded to avoid assigning them to the wrong signal. Description refresh retains MATLAB’s two `D` requests, separated by 0.5 seconds.
+
+STOP cancels pending writes, sends the original three zero commands, and resends the latest signal routing if needed. The protocol has no acknowledgement, so output-queue completion confirms transmission through the serial driver, rather than confirmation that firmware applied the commands. STOP remains a software command.
+
+The acquisition model writes sample batches and gap fills into fixed-size array buffers. Overlapping batches update retained values without dropping their new tail or duplicating history timestamps. This preserves the original first-value gap-fill rule and chronological export while avoiding per-sample Python work after large device-tick jumps. The 10 ms display step, 20-second sweep, and default 115200 baud are unchanged.
+
+## Live display and timing
+
+Live plots refresh at 20 Hz by default, with selectable 5/10/20/30 Hz rates. The 5 Hz option matches MATLAB’s original 0.2-second timer. Screen refresh is separate from the 10 ms sample step and the serial link speed. Changed channels alone update their plot data, and thin lines without antialiasing reduce live drawing cost.
+
+Receive processing handles at most 256 queued events or about 4 ms of work per 10 ms GUI turn, whichever limit is reached first. Remaining events stay queued for subsequent turns. This limits how long normal receive work can occupy the GUI; it does not make a slow operation run faster or remove the bounded-queue overflow limit. Pending and dropped counts remain visible in the status bar.
+
+The display divider at row 13, column 20 is initialized once valid timing arrives for each connection, even if that timing equals the default 0.0001-second sample period. STOP resynchronizes the divider after cancelling pending commands. A change in device sample period clears the live sweep and recording histories to avoid mixing timestamp scales; device state, selections, and raw scope samples are retained.
 
 ## Recordings and analysis
 

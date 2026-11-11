@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "uart-studio"
-version = "1.0.0"
-description = "Python desktop successor to the MATLAB GUIDE UART control and acquisition tools"
+name = "js-uart"
+version = "1.1.0"
+description = "JS: Python desktop UART control, acquisition, and offline analysis"
 requires-python = ">=3.10"
 dependencies = [
   "PySide6-Essentials>=6.7,<7",
@@ -19,6 +19,7 @@ dependencies = [
 dev = ["pytest>=8,<10"]
 
 [project.scripts]
+js = "uart_gui.app:main"
 uart-studio = "uart_gui.app:main"
 
 [tool.setuptools.packages.find]

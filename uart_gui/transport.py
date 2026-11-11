@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 from queue import Empty, Full, Queue
 import threading
+import time
 from typing import Callable
 
 from .protocol import Description, Event, PlotSamples, ScopeSamples, StreamDecoder, Values, encode_command
@@ -43,6 +44,7 @@ class SerialTransport:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._write_lock = threading.Lock()
+        self._output_drain = None
 
     @property
     def connected(self) -> bool:
@@ -125,6 +127,70 @@ class SerialTransport:
                 self._stop.set()
                 raise ConnectionError(f"Serial write failed: {exc}") from exc
 
+    def wait_output(self, timeout: float = 2.0, *, cancelled=None, progress=None) -> bool:
+        """Wait for driver-confirmed transmission without blocking the reader.
+
+        ``write`` can return while bytes remain in the OS transmit queue. Use
+        this boundary after a routing transaction before attributing samples
+        to its new signals. It is not an acknowledgement from the firmware.
+
+        Some drivers can block indefinitely in flush/tcdrain, so that OS call
+        runs in a daemon helper. The calling command worker remains bounded
+        and cancellable, and can keep forwarding received events. Cancellation
+        does not retract bytes already queued: subsequent STOP commands follow
+        them on the wire. A timeout must be followed by disconnecting the port.
+        """
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("output timeout must be positive and finite")
+        if cancelled is not None and cancelled():
+            return False
+        if not self.connected:
+            raise ConnectionError("serial port is not connected")
+        connection = self._serial
+        deadline = time.monotonic() + timeout
+
+        def await_drain(completed, errors):
+            while True:
+                if progress is not None:
+                    progress()
+                if cancelled is not None and cancelled():
+                    return False
+                if self._stop.is_set() or self._serial is not connection:
+                    return False
+                if completed.is_set():
+                    if errors:
+                        raise ConnectionError(f"Serial output drain failed: {errors[0]}") from errors[0]
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Serial output did not drain within the timeout; disconnecting the port is required")
+                completed.wait(min(.01, remaining))
+
+        # A cancelled route may leave its OS drain in progress. Finish that
+        # helper before starting the drain for this transaction, limiting the
+        # device to one helper even during repeated routing changes. A fresh
+        # drain is still required for bytes queued after the earlier call.
+        if self._output_drain is not None:
+            previous_connection, previous_completed, previous_errors = self._output_drain
+            if previous_connection is connection and not previous_completed.is_set():
+                if not await_drain(previous_completed, previous_errors):
+                    return False
+
+        completed = threading.Event()
+        errors: list[Exception] = []
+
+        def flush():
+            try:
+                connection.flush()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        self._output_drain = (connection, completed, errors)
+        threading.Thread(target=flush, name="uart-output-drain", daemon=True).start()
+        return await_drain(completed, errors)
+
     def _read_loop(self, connection) -> None:
         try:
             while not self._stop.is_set():
@@ -181,6 +247,11 @@ class DemoTransport(SerialTransport):
     def disconnect(self) -> None:
         self._demo_connected = False
         super().disconnect()
+
+    def wait_output(self, timeout: float = 2.0, *, cancelled=None, progress=None) -> bool:
+        if progress is not None:
+            progress()
+        return self.connected and not (cancelled is not None and cancelled())
 
     def send(self, value: float, row: int, column: int, command: int | str = 0) -> None:
         packet = encode_command(value, row, column, command)

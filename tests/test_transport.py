@@ -2,6 +2,7 @@ import os
 from queue import Empty
 import select
 import struct
+import threading
 import time
 
 import pytest
@@ -106,3 +107,118 @@ def test_queue_overflow_is_counted_and_error_remains_visible():
     transport._publish(TransportError("removed"))
     assert transport.dropped_events == 2
     assert transport.events.get_nowait() == TransportError("removed")
+
+
+class ControlledSerialOutput:
+    """Model an OS output queue whose drain can stall independently of writes."""
+    def __init__(self):
+        self.is_open = True
+        self.entered_flush = threading.Event()
+        self.release_flush = threading.Event()
+        self.writes = []
+        self.failure = None
+        self.flush_calls = 0
+
+    def flush(self):
+        self.flush_calls += 1
+        self.entered_flush.set()
+        self.release_flush.wait()
+        if self.failure is not None:
+            raise self.failure
+
+    def write(self, packet):
+        self.writes.append(packet)
+        return len(packet)
+
+    def close(self):
+        self.is_open = False
+        self.release_flush.set()
+
+
+def test_output_drain_waits_for_driver_and_leaves_writes_and_progress_unblocked():
+    transport = SerialTransport()
+    connection = ControlledSerialOutput()
+    transport._serial = connection
+    result = []
+    progress = []
+    worker = threading.Thread(target=lambda: result.append(transport.wait_output(progress=lambda: progress.append(True))))
+    try:
+        worker.start()
+        assert connection.entered_flush.wait(1)
+        assert worker.is_alive() and not result
+        transport.send(1, 2, 0)
+        assert connection.writes == [encode_command(1, 2, 0)]
+        connection.release_flush.set()
+        worker.join(1)
+        assert result == [True] and progress
+    finally:
+        transport.disconnect()
+        worker.join(1)
+
+
+def test_stalled_output_drain_is_cancellable_without_closing_port_needed_for_stop():
+    transport = SerialTransport()
+    connection = ControlledSerialOutput()
+    transport._serial = connection
+    cancelled = threading.Event()
+    result = []
+    worker = threading.Thread(target=lambda: result.append(transport.wait_output(cancelled=cancelled.is_set)))
+    try:
+        worker.start()
+        assert connection.entered_flush.wait(1)
+        cancelled.set()
+        worker.join(.5)
+        assert result == [False]
+        assert transport.connected
+        transport.send(0, 2, 0)
+        assert connection.writes == [encode_command(0, 2, 0)]
+    finally:
+        transport.disconnect()
+        worker.join(1)
+
+
+def test_stalled_output_drain_has_bounded_timeout_and_driver_errors_propagate():
+    transport = SerialTransport()
+    connection = ControlledSerialOutput()
+    transport._serial = connection
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="did not drain"):
+            transport.wait_output(timeout=.05)
+        assert time.monotonic() - started < .5
+        connection.failure = OSError("driver removed")
+        connection.release_flush.set()
+        with pytest.raises(ConnectionError, match="driver removed"):
+            transport.wait_output()
+    finally:
+        transport.disconnect()
+
+
+def test_replacing_cancelled_route_does_not_accumulate_stalled_flush_helpers():
+    transport = SerialTransport()
+    connection = ControlledSerialOutput()
+    transport._serial = connection
+    cancel_first = threading.Event()
+    results = []
+    first = threading.Thread(target=lambda: results.append(transport.wait_output(cancelled=cancel_first.is_set)))
+    progressed = threading.Event()
+    second = threading.Thread(target=lambda: results.append(transport.wait_output(progress=progressed.set)))
+    try:
+        first.start()
+        assert connection.entered_flush.wait(1)
+        cancel_first.set()
+        first.join(.5)
+        assert results == [False]
+        transport.send(4, 13, 0)  # New transaction queued after the first drain.
+        second.start()
+        assert progressed.wait(1)
+        assert connection.flush_calls == 1  # Wait for existing OS call first.
+        connection.release_flush.set()
+        second.join(1)
+        assert results == [False, True]
+        assert connection.flush_calls == 2  # Fresh drain covers the new bytes.
+    finally:
+        transport.disconnect()
+        first.join(1)
+        if second.ident is not None:
+            second.join(1)

@@ -1,4 +1,4 @@
-"""UART Studio desktop workspace. Run with ``python -m uart_gui --demo``."""
+"""JS desktop workspace. Run with ``python -m uart_gui --demo``."""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 from queue import Empty
 import sys
+import time
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
@@ -22,7 +23,7 @@ import pyqtgraph as pg
 from .catalog import FIELD_BY_ADDRESS, SECTIONS, START_COMMANDS, STOP_COMMANDS
 from .model import AcquisitionModel
 from .protocol import Description, PlotSamples, Values, encode_command
-from .session import Session
+from .session import RoutingComplete, Session
 from .style import COLORS, STYLESHEET
 from .transport import TransportError, available_ports
 
@@ -49,20 +50,25 @@ def card():
 
 
 class MainWindow(QMainWindow):
+    RECEIVE_MAX_EVENTS = 256
+    RECEIVE_BUDGET_SECONDS = .004
+
     def __init__(self, *, demo=False):
         super().__init__()
-        self.setWindowTitle("UART Studio · Device workspace")
+        self.setWindowTitle("JS · Device workspace")
         self.resize(1440, 920)
         self.setMinimumSize(1140, 720)
         self.model = AcquisitionModel()
         self.session = Session(self)
         self.session.state_changed.connect(self._state_changed)
         self.session.message.connect(self.log)
-        self.session.routing_finished.connect(self._routing_finished)
         self._pending_connection = False
         self._paused = False
         self._events_count = 0
         self._routing_pending = None
+        self._routing_discarded = 0
+        self._last_divider = None
+        self._last_timing_warning = None
         self._editors = {}
         self._field_rows = {}
         self._checkboxes = {}
@@ -71,6 +77,7 @@ class MainWindow(QMainWindow):
         self._write_buttons = []
         self._curves = {}
         self._curve_labels = {}
+        self._curve_revisions = {}
         self._scope_curves = {}
         self._scope_data = {}
         self._build()
@@ -78,11 +85,12 @@ class MainWindow(QMainWindow):
         self._state_changed(False, "Disconnected")
         self._build_table(0)
         self._refresh_timer = QTimer(self)
+        self._refresh_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._refresh_timer.timeout.connect(self._refresh)
-        self._refresh_timer.start(150)
+        self._refresh_timer.start(self.refresh_rate.currentData())
         self._receive_timer = QTimer(self)
         self._receive_timer.timeout.connect(self._receive)
-        self._receive_timer.start(30)
+        self._receive_timer.start(10)
         self.log("Workspace ready. Connect a serial device or explore with Demo mode.")
         if demo:
             QTimer.singleShot(0, self.start_demo)
@@ -98,8 +106,8 @@ class MainWindow(QMainWindow):
         sidebar.setFixedWidth(178)
         side = QVBoxLayout(sidebar)
         side.setContentsMargins(16, 28, 16, 24)
-        side.addWidget(label("◉ UART", "brand"))
-        side.addWidget(label("S T U D I O    /    1.0", "brandSub"))
+        side.addWidget(label("◉ JS", "brand"))
+        side.addWidget(label("S E R I A L    /    1.1", "brandSub"))
         side.addSpacing(38)
         side.addWidget(label("DEVICE WORKSPACE", "sideLabel"))
         self.navigation = QListWidget()
@@ -219,6 +227,14 @@ class MainWindow(QMainWindow):
         plot_heading.addStretch()
         self.channel_count = label("0 / 15 channels", "muted")
         plot_heading.addWidget(self.channel_count)
+        self.refresh_rate = QComboBox()
+        self.refresh_rate.setObjectName("refreshRate")
+        for caption, interval in [("5 Hz", 200), ("10 Hz", 100), ("20 Hz", 50), ("30 Hz", 33)]:
+            self.refresh_rate.addItem(caption, interval)
+        self.refresh_rate.setCurrentIndex(2)
+        self.refresh_rate.setToolTip("Plot refresh rate. Recording keeps every received sample. 5 Hz matches the original MATLAB timer.")
+        self.refresh_rate.currentIndexChanged.connect(self._change_refresh_rate)
+        plot_heading.addWidget(self.refresh_rate)
         plot_layout.addLayout(plot_heading)
         self.plot_note = label("20 s sweep  ·  10 ms display step  ·  Drag to zoom", "muted")
         plot_layout.addWidget(self.plot_note)
@@ -279,8 +295,8 @@ class MainWindow(QMainWindow):
             action.triggered.connect(callback)
             menu.addAction(action)
         help_menu = self.menuBar().addMenu("Help")
-        help_action = QAction("About UART Studio", self)
-        help_action.triggered.connect(lambda: QMessageBox.information(self, "UART Studio", "Python successor to the MATLAB GUIDE UART tools.\n\n15 plot channels · 142 device fields · MAT/CSV recordings\n\nDevice names arrive from firmware. Demo mode uses simulated data.\nPhysical firmware compatibility requires testing on your device.\n\nSee README.md and docs/MIGRATION.md for setup and protocol details."))
+        help_action = QAction("About JS", self)
+        help_action.triggered.connect(lambda: QMessageBox.information(self, "JS", "Python successor to the MATLAB GUIDE UART tools.\n\n15 plot channels · 142 device fields · MAT/CSV recordings\n\nDevice names arrive from firmware. Demo mode uses simulated data.\nPhysical firmware compatibility requires testing on your device.\n\nSee README.md and docs/MIGRATION.md for setup and protocol details."))
         help_menu.addAction(help_action)
 
     @staticmethod
@@ -441,6 +457,9 @@ class MainWindow(QMainWindow):
         self._clear_session_events()
         self._pending_connection = True
         self._routing_pending = None
+        self._routing_discarded = 0
+        self._last_divider = None
+        self._last_timing_warning = None
         self.connect_button.setEnabled(False)
         self.demo_button.setEnabled(False)
         self.status_pill.setText("● Connecting…")
@@ -483,14 +502,15 @@ class MainWindow(QMainWindow):
         self._refresh_fields()
 
     def refresh_descriptions(self):
-        # Match two requests separated by .5 seconds without blocking the GUI.
-        self.send_commands([(0, 0, 0, "D")], "Description request")
-        generation = self.session._generation
-        QTimer.singleShot(500, lambda: self.send_commands([(0, 0, 0, "D")]) if self.session.connected and self.session._generation == generation else None)
-
-    def send_commands(self, commands, caption="", *, urgent=False):
         try:
-            self.session.send_many(commands, urgent=urgent, label=caption)
+            # One ordered worker job keeps both D requests ahead of routing.
+            self.session.request_descriptions()
+        except ConnectionError as exc:
+            self.notify(str(exc))
+
+    def send_commands(self, commands, caption="", *, urgent=False, priority=5):
+        try:
+            self.session.send_many(commands, urgent=urgent, label=caption, priority=priority)
             return True
         except (ValueError, ConnectionError) as exc:
             self.notify(str(exc))
@@ -533,6 +553,9 @@ class MainWindow(QMainWindow):
 
     def stop_device(self):
         if self.send_commands(STOP_COMMANDS, "STOP ALL", urgent=True):
+            # STOP cancels queued writes, potentially including the initial divider.
+            self._last_divider = None
+            self._sync_sample_timing(self.model.values.get((0, 2)))
             if self._routing_pending is not None or any(slot is not None for slot in self.model.slots):
                 self._route_signals()
 
@@ -544,8 +567,8 @@ class MainWindow(QMainWindow):
     def _routing_finished(self, revision):
         if revision != self._routing_pending:
             return
-        # Discard samples received while mappings were in transition.
-        self._receive(drop_plots=True)
+        # This marker shares the telemetry FIFO, so all transition samples
+        # have been processed before accepting samples under the new mapping.
         self._routing_pending = None
         self.empty_hint.setText("Select signals on the left to start plotting.")
         self.log("Signal routing sent. Device acknowledgement is not available.")
@@ -565,44 +588,74 @@ class MainWindow(QMainWindow):
             self._route_signals()
         self._refresh_plot()
 
-    def _receive(self, *, drop_plots=False):
+    def _receive(self):
         if self._pending_connection:
             return
         changed_names = False
-        for _ in range(20000 if drop_plots else 1500):
+        deadline = time.perf_counter() + self.RECEIVE_BUDGET_SECONDS
+        for index in range(self.RECEIVE_MAX_EVENTS):
+            # Bound work per Qt turn. Leave excess packets queued for the next
+            # turn instead of freezing rendering or throwing away recording data.
+            if index and time.perf_counter() >= deadline:
+                break
             try:
                 event = self.session.events.get_nowait()
             except Empty:
                 break
-            if isinstance(event, TransportError):
+            if isinstance(event, RoutingComplete):
+                self._routing_finished(event.revision)
+            elif isinstance(event, TransportError):
                 self.log("Connection error: " + event.message)
                 self.statusBar().showMessage(event.message)
-                continue
-            if isinstance(event, PlotSamples) and (drop_plots or self._routing_pending is not None):
-                continue
-            self._events_count += 1
-            self.model.handle(event)
-            changed_names |= isinstance(event, Description)
-            if isinstance(event, Values) and event.row == 0 and len(event.values) > 2:
-                sample_period = event.values[2]
-                if math.isfinite(sample_period) and sample_period > 0 and not math.isclose(sample_period, self.model.sample_period, rel_tol=1e-6):
-                    divider = math.floor(self.model.step / sample_period)
-                    if divider >= 1:
-                        self.model.sample_period = sample_period
-                        self.send_commands([(divider, 13, 20)], "Display sample divider")
-                    else:
-                        self.log("Device sample period exceeds the 10 ms display step; divider unchanged.")
+            elif isinstance(event, PlotSamples) and self._routing_pending is not None:
+                # Routing changes have no wire acknowledgement or signal ID.
+                # Samples in this short transition cannot be attributed safely.
+                self._routing_discarded += 1
+            else:
+                self._events_count += 1
+                self.model.handle(event)
+                changed_names |= isinstance(event, Description)
+                if isinstance(event, Values) and event.row == 0 and len(event.values) > 2:
+                    self._sync_sample_timing(event.values[2])
         if changed_names:
             self._filter()
 
+    def _sync_sample_timing(self, sample_period):
+        if sample_period is None or not math.isfinite(sample_period) or sample_period <= 0:
+            return
+        ratio = self.model.step / sample_period
+        if not math.isfinite(ratio) or ratio < 1 or ratio > float(np.finfo(np.float32).max):
+            if self._last_timing_warning != sample_period:
+                self.log("Invalid device sample period for the display divider; timing unchanged.")
+                self._last_timing_warning = sample_period
+            return
+        divider = math.floor(ratio)
+        if not math.isclose(sample_period, self.model.sample_period, rel_tol=1e-6):
+            # A different device clock changes timestamp-to-bucket conversion.
+            # Preserve raw scopes, but start a fresh sweep/history for that clock.
+            scopes = self.model.scope
+            self.model.clear()
+            self.model.scope = scopes
+            self.model.sample_period = sample_period
+            self.log("Device sample period changed; plot and history buffers reset.")
+        if self.session.connected and divider != self._last_divider:
+            if self.send_commands([(divider, 13, 20)], "Display sample divider", priority=2):
+                self._last_divider = divider
+
     def _refresh_fields(self):
         error = self.model.values.get((0, 1))
-        self.device_error.setText("Device error: " + (format(error, ".7g") if error is not None else "—"))
-        self.device_error.setStyleSheet("color: #b64238; font-weight: 600;" if error else "")
+        error_text = "Device error: " + (format(error, ".7g") if error is not None else "—")
+        if self.device_error.text() != error_text:
+            self.device_error.setText(error_text)
+            self.device_error.setStyleSheet("color: #b64238; font-weight: 600;" if error else "")
         for address, item in self._live_items.items():
             value = self.model.values.get(address)
-            item.setText(format(value, ".7g") if value is not None else "—")
-            self._name_items[address].setText(self.field_label(address))
+            value_text = format(value, ".7g") if value is not None else "—"
+            if item.text() != value_text:
+                item.setText(value_text)
+            caption = self.field_label(address)
+            if self._name_items[address].text() != caption:
+                self._name_items[address].setText(caption)
         # Edits are intentionally not overwritten by incoming telemetry.
 
     def _refresh_plot(self):
@@ -611,13 +664,17 @@ class MainWindow(QMainWindow):
             if channel not in selected or self._curve_labels[channel] != self.field_label(selected[channel]):
                 self.plot.removeItem(self._curves.pop(channel))
                 self._curve_labels.pop(channel, None)
+                self._curve_revisions.pop(channel, None)
         for channel, address in selected.items():
             caption = self.field_label(address)
             if channel not in self._curves:
-                self._curves[channel] = self.plot.plot([], [], pen=pg.mkPen(COLORS[channel], width=1.8), name=caption)
+                self._curves[channel] = self.plot.plot([], [], pen=pg.mkPen(COLORS[channel], width=1), antialias=False, name=caption)
                 self._curve_labels[channel] = caption
-            times, values = self.model.plot_data(channel)
-            self._curves[channel].setData(times, values, connect="finite")
+            revision = self.model.plot_revisions[channel]
+            if self._curve_revisions.get(channel) != revision:
+                times, values = self.model.plot_data(channel)
+                self._curves[channel].setData(times, values, connect="finite")
+                self._curve_revisions[channel] = revision
         for channel in list(self._scope_curves):
             if channel not in self.model.scope:
                 self.scope_plot.removeItem(self._scope_curves.pop(channel))
@@ -625,9 +682,10 @@ class MainWindow(QMainWindow):
         for channel, values in self.model.scope.items():
             if channel not in self._scope_curves:
                 self._scope_curves[channel] = self.scope_plot.plot([], [], pen=pg.mkPen(COLORS[channel % 15], width=1.4), name=f"Scope {channel + 1}")
-            if self._scope_data.get(channel) is not values:
+            previous = self._scope_data.get(channel)
+            if previous is None or previous[0] is not values or previous[1] != self.model.sample_period:
                 self._scope_curves[channel].setData(np.arange(len(values)) * self.model.sample_period, values, connect="finite")
-                self._scope_data[channel] = values
+                self._scope_data[channel] = (values, self.model.sample_period)
         self.channel_count.setText(f"{len(selected)} / 15 channels")
         self.empty_hint.setVisible((not selected or self._routing_pending is not None) and self.plot_tabs.currentIndex() == 0)
         self.plot_tabs.setTabText(1, f"Scopes ({len(self.model.scope)})" if self.model.scope else "Scopes")
@@ -638,8 +696,15 @@ class MainWindow(QMainWindow):
             self._refresh_plot()
         transport = self.session.transport
         if transport is not None:
-            dropped = transport.dropped_events + self.session.dropped_events
-            self.statusBar().showMessage(f"{'SIMULATED DATA' if self.session.demo else 'Serial'}  ·  RX {transport.bytes_received:,} B  ·  TX {transport.bytes_sent:,} B  ·  {self._events_count:,} events  ·  dropped {dropped:,}  ·  Ts {self.model.sample_period:g} s")
+            dropped = transport.dropped_events + self.session.dropped_events + self._routing_discarded
+            queued = transport.events.qsize() + self.session.events.qsize()
+            status = f"{'SIMULATED DATA' if self.session.demo else 'Serial'}  ·  RX {transport.bytes_received:,} B  ·  TX {transport.bytes_sent:,} B  ·  dropped {dropped:,}  ·  pending {queued:,}  ·  Ts {self.model.sample_period:g} s"
+            if self.statusBar().currentMessage() != status:
+                self.statusBar().showMessage(status)
+
+    def _change_refresh_rate(self):
+        if hasattr(self, "_refresh_timer"):
+            self._refresh_timer.setInterval(self.refresh_rate.currentData())
 
     def toggle_pause(self):
         self._paused = not self._paused
@@ -717,15 +782,15 @@ class MainWindow(QMainWindow):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="UART Studio desktop control and acquisition")
+    parser = argparse.ArgumentParser(description="JS desktop control and acquisition")
     parser.add_argument("--demo", action="store_true", help="Start with simulated telemetry; no serial port is opened")
     args = parser.parse_args(argv)
     application = QApplication.instance() or QApplication(sys.argv[:1])
-    application.setApplicationName("UART Studio")
+    application.setApplicationName("JS")
     application.setStyle("Fusion")
     application.setStyleSheet(STYLESHEET)
     application.setFont(QFont("Inter", 10))
-    pg.setConfigOptions(antialias=True)
+    pg.setConfigOptions(antialias=False)
     window = MainWindow(demo=args.demo)
     window.show()
     return application.exec()

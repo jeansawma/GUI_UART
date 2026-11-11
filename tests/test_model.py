@@ -1,4 +1,3 @@
-import csv
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,6 +66,104 @@ class ModelTests(unittest.TestCase):
         model.handle(PlotSamples(0, (2.,), 0))
         np.testing.assert_equal(model.history_data(0)[1], [2])
 
+    def test_newer_overlapping_packets_replace_and_extend_history(self):
+        model = AcquisitionModel(sample_period=.01, step=.01, window=2, max_history=20)
+        model.select_signal(0, 0)
+        model.handle(PlotSamples(0, (1., 2., 3., 4., 5.), 100))
+        self.assertTrue(model.handle(PlotSamples(0, (10., 11., 12., 13., 14.), 102)))
+        times, values = model.history_data(0)
+        np.testing.assert_allclose(times, np.arange(100, 107) * .01)
+        np.testing.assert_equal(values, [1, 2, 10, 11, 12, 13, 14])
+        np.testing.assert_equal(model.vplot[100:107, 0], values)
+
+        # A newer start need not extend the previous packet's tail. It still
+        # updates retained overlapping points without shortening the history.
+        model.handle(PlotSamples(0, (20., 21.), 103))
+        np.testing.assert_equal(model.history_data(0)[1], [1, 2, 10, 20, 21, 13, 14])
+        revisions = model.plot_revisions.copy()
+        self.assertFalse(model.handle(PlotSamples(0, (99.,) * 10, 101)))
+        self.assertEqual(model.plot_revisions, revisions)
+        np.testing.assert_equal(model.history_data(0)[1], [1, 2, 10, 20, 21, 13, 14])
+
+    def test_large_gap_fills_only_retained_live_and_history_samples(self):
+        model = AcquisitionModel(max_history=5)
+        model.select_signal(0, 0)
+        model.handle(PlotSamples(0, (1.,), 0))
+        model.handle(PlotSamples(0, (2., 3.), 1000000000))
+        times, values = model.history_data(0)
+        np.testing.assert_allclose(times, np.arange(9999997, 10000002) * .01)
+        np.testing.assert_equal(values, [2, 2, 2, 2, 3])
+        np.testing.assert_equal(model.vplot[2:-1, 0], 2)
+        self.assertEqual(model.vplot[0, 0], 2)
+        self.assertEqual(model.vplot[1, 0], 3)
+        self.assertEqual(model.vplot[-1, 0], 2)
+
+    def test_old_overlap_cannot_overwrite_newer_sweep_positions(self):
+        model = AcquisitionModel(sample_period=.01, step=.01, window=.1, max_history=40)
+        model.select_signal(0, 0)
+        model.handle(PlotSamples(0, tuple(range(30)), 0))
+        before = model.vplot[:, 0].copy()
+        model.handle(PlotSamples(0, (100., 101.), 1))
+        np.testing.assert_equal(model.vplot[:, 0], before)
+        np.testing.assert_equal(model.history_data(0)[1][1:3], [100, 101])
+
+    def test_ring_matches_chronological_reference_for_packet_overlap(self):
+        model = AcquisitionModel(sample_period=.01, step=.01, window=.2, max_history=17)
+        model.select_signal(0, 0)
+        rng = np.random.default_rng(42)
+        reference = {}
+        start = 3
+        highwater = None
+        for _ in range(100):
+            start += int(rng.integers(0, 8))
+            packet = tuple(rng.normal(size=int(rng.integers(1, 13))))
+            if highwater is not None:
+                for index in range(highwater + 1, start):
+                    reference[index] = packet[0]
+            for index, value in enumerate(packet, start):
+                reference[index] = value
+            highwater = max(highwater if highwater is not None else start,
+                            start + len(packet) - 1)
+            self.assertTrue(model.handle(PlotSamples(0, packet, start)))
+            retained = sorted(reference)[-17:]
+            times, values = model.history_data(0)
+            np.testing.assert_allclose(times, np.asarray(retained) * .01)
+            np.testing.assert_allclose(values, [reference[index] for index in retained])
+            live = np.full(len(model.tm), np.nan)
+            for index in sorted(reference):
+                if index > highwater - 20:
+                    live[index % 20] = reference[index]
+            live[-1] = live[0]
+            np.testing.assert_equal(model.vplot[:, 0], live)
+
+    def test_revisions_track_only_affected_plot_channels(self):
+        model = AcquisitionModel()
+        original = model.plot_revisions.copy()
+        model.select_signal(0, 0)
+        self.assertEqual(model.plot_revisions[0], original[0] + 1)
+        self.assertEqual(model.plot_revisions[1:], original[1:])
+        model.select_signal(0, 1)
+        before = model.plot_revisions.copy()
+        model.handle(PlotSamples(1, (1.,), 0))
+        self.assertEqual(model.plot_revisions[0], before[0])
+        self.assertEqual(model.plot_revisions[1], before[1] + 1)
+        before = model.plot_revisions.copy()
+        model.handle(Description(0, 0, "Speed"))
+        self.assertEqual(model.plot_revisions[0], before[0] + 1)
+        self.assertEqual(model.plot_revisions[1:], before[1:])
+        before = model.plot_revisions.copy()
+        model.clear()
+        self.assertEqual(model.plot_revisions, [revision + 1 for revision in before])
+
+    def test_positive_to_negative_signed_tick_boundary_is_continuous(self):
+        model = AcquisitionModel(sample_period=.01, step=.01, window=.1, max_history=5)
+        model.select_signal(0, 0)
+        model.handle(PlotSamples(0, (1.,), 0x7fffffff))
+        model.handle(PlotSamples(0, (2.,), -0x80000000))
+        times, values = model.history_data(0)
+        np.testing.assert_allclose(times, np.asarray([0x7fffffff, 0x80000000]) * .01)
+        np.testing.assert_equal(values, [1, 2])
+
     def test_clear_and_reselect_remove_old_data(self):
         model = AcquisitionModel()
         model.select_signal(0, 0)
@@ -130,6 +227,25 @@ class ModelTests(unittest.TestCase):
                                        [[10, np.nan], [20, np.nan], [np.nan, 30]],
                                        equal_nan=True)
             self.assertEqual(recording.labels[:2], ("First", "Second"))
+
+    def test_exports_preserve_chronological_ring_order_after_capacity_wrap(self):
+        model = AcquisitionModel(sample_period=.01, step=.01, window=.1, max_history=5)
+        model.select_signal(0, 0)
+        model.handle(PlotSamples(0, (1., 2.), 8))
+        model.handle(PlotSamples(0, (3., 4.), 12))
+        with tempfile.TemporaryDirectory() as directory:
+            for suffix in (".mat", ".csv"):
+                path = Path(directory) / ("retained" + suffix)
+                if suffix == ".mat":
+                    model.export_mat(path)
+                    source = loadmat(path)
+                    np.testing.assert_equal(source["valid_lengths"][0], [5])
+                    np.testing.assert_equal(source["vmem"][:, 0], [2, 3, 3, 3, 4])
+                else:
+                    model.export_csv(path)
+                recording = import_recording(path)
+                np.testing.assert_allclose(recording.times, [.09, .10, .11, .12, .13])
+                np.testing.assert_equal(recording.values[:, 0], [2, 3, 3, 3, 4])
 
     def test_scope_only_export_and_import(self):
         model = AcquisitionModel(sample_period=.0002)

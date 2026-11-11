@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import itertools
-from queue import Empty, PriorityQueue, Queue
+from dataclasses import dataclass
+from queue import Empty, Full, PriorityQueue, Queue
 import threading
 import time
 
@@ -10,6 +11,13 @@ from PySide6.QtCore import QObject, Signal
 
 from .protocol import encode_command
 from .transport import DemoTransport, SerialTransport, TransportError
+
+
+@dataclass(frozen=True)
+class RoutingComplete:
+    """FIFO boundary: preceding samples belong to the previous routing."""
+
+    revision: int
 
 
 class Session(QObject):
@@ -43,7 +51,7 @@ class Session(QObject):
         self._generation += 1
         self._enqueue("disconnect", priority=0)
 
-    def send_many(self, commands, *, urgent=False, label=""):
+    def send_many(self, commands, *, urgent=False, label="", priority=5):
         # Validate every edit before queueing any writes.
         commands = tuple(tuple(command) for command in commands)
         for command in commands:
@@ -52,7 +60,7 @@ class Session(QObject):
             raise ConnectionError("Connect a device or start demo mode first.")
         if urgent:
             self._generation += 1  # cancel pending batch/routing commands
-        self._enqueue("send", (commands, label), 0 if urgent else 5)
+        self._enqueue("send", (commands, label), 0 if urgent else priority)
 
     def route(self, commands):
         commands = tuple(tuple(command) for command in commands)
@@ -64,27 +72,71 @@ class Session(QObject):
         self._enqueue("route", (commands, self._routing_revision), priority=3)
         return self._routing_revision
 
-    def _drain(self):
+    def request_descriptions(self):
+        """Queue MATLAB's D / 500 ms / D handshake ahead of plot routing."""
+        if not self.connected:
+            raise ConnectionError("Connect a device before requesting descriptions.")
+        self._enqueue("descriptions", priority=1)
+
+    def _active(self, generation, routing_revision=None):
+        return (generation == self._generation and not self._closed.is_set()
+                and self.connected
+                and (routing_revision is None or routing_revision == self._routing_revision))
+
+    def _wait(self, duration, generation):
+        """Pace only the operations that need it, while forwarding telemetry."""
+        deadline = time.monotonic() + duration
+        while self._active(generation):
+            self._drain()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._active(generation)
+            self._closed.wait(min(.01, remaining))
+        return False
+
+    def _wait_output(self, generation, routing_revision=None):
+        return self.transport.wait_output(
+            timeout=2.0,
+            cancelled=lambda: not self._active(generation, routing_revision),
+            progress=self._drain,
+        )
+
+    def _drain(self, limit=2000, *, cancelled=None):
         if self.transport is None:
             return
-        for _ in range(2000):
+        for _ in range(limit):
+            if cancelled is not None and cancelled():
+                break
             try:
                 event = self.transport.events.get_nowait()
             except Empty:
                 break
-            if not self.events.full():
-                self.events.put_nowait(event)
-            else:
-                self.dropped_events += 1
-                if isinstance(event, TransportError):
-                    try:
-                        self.events.get_nowait()
-                    except Empty:
-                        pass
-                    self.events.put_nowait(event)
+            self._publish(event, required=isinstance(event, TransportError))
             if isinstance(event, TransportError) and event.fatal:
                 self.connected = False
                 self.state_changed.emit(False, "Disconnected")
+
+    def _publish(self, event, *, required=False):
+        try:
+            self.events.put_nowait(event)
+        except Full:
+            if not required:
+                self.dropped_events += 1
+                return
+            # Preserve ordered routing boundaries and errors. Replacing the
+            # oldest event preserves FIFO ordering among all retained events,
+            # counts that loss, and never blocks shutdown on a full GUI queue.
+            while True:
+                try:
+                    self.events.get_nowait()
+                    self.dropped_events += 1
+                except Empty:
+                    pass
+                try:
+                    self.events.put_nowait(event)
+                    return
+                except Full:
+                    continue
 
     def _disconnect(self, announce=True):
         self.connected = False
@@ -98,7 +150,7 @@ class Session(QObject):
             while not self._closed.is_set():
                 self._drain()
                 try:
-                    _, _, generation, operation, args = self._jobs.get(timeout=.03)
+                    _, _, generation, operation, args = self._jobs.get(timeout=.01)
                 except Empty:
                     continue
                 if generation != self._generation:
@@ -122,29 +174,51 @@ class Session(QObject):
                         self.state_changed.emit(True, "Demo · simulated device" if self.demo else args[0])
                     elif operation == "disconnect":
                         self._disconnect()
+                    elif operation == "descriptions":
+                        if not self._active(generation):
+                            continue
+                        self.transport.send(0, 0, 0, "D")
+                        if not self._wait_output(generation):
+                            continue
+                        if not self._wait(.5, generation):
+                            continue
+                        self.transport.send(0, 0, 0, "D")
+                        if self._wait_output(generation):
+                            self.message.emit("Description requests sent (device acknowledgement not available)")
                     elif operation in ("send", "route"):
                         commands, detail = args
                         if operation == "route" and detail != self._routing_revision:
                             continue
                         for index, command in enumerate(commands):
-                            if generation != self._generation or self._closed.is_set():
+                            if not self._active(generation):
                                 break
                             if operation == "route" and detail != self._routing_revision:
                                 break
                             self.transport.send(*command)
                             self._drain()
-                            # Preserve the firmware pacing in MATLAB's ENTER ALL.
-                            time.sleep(.3 if (index + 1) % 10 == 0 else .01)
+                            # Plot_Fill_UART has no pauses. Retain the existing
+                            # ENTER ALL batch pacing for numeric writes only.
+                            if operation == "send" and (index + 1) % 10 == 0 and index + 1 < len(commands):
+                                if not self._wait(.3, generation):
+                                    break
                         else:
                             self._drain()
                             if operation == "route":
-                                self.routing_finished.emit(detail)
+                                if self._wait_output(generation, detail) and self._active(generation, detail):
+                                    # Preserve the boundary even when the reader
+                                    # has more than a normal turn's 2,000 events.
+                                    # Snapshot the FIFO length so an ongoing
+                                    # producer cannot extend this drain forever.
+                                    pending = self.transport.events.qsize()
+                                    self._drain(pending, cancelled=lambda: not self._active(generation, detail))
+                                    if self._active(generation, detail):
+                                        self._publish(RoutingComplete(detail), required=True)
+                                        self.routing_finished.emit(detail)
                             elif detail:
                                 self.message.emit(detail + " sent (device acknowledgement not available)")
                 except Exception as exc:
                     self.message.emit(str(exc))
-                    if not self.events.full():
-                        self.events.put_nowait(TransportError(str(exc)))
+                    self._publish(TransportError(str(exc)), required=True)
                     self._disconnect()
         finally:
             self._disconnect()

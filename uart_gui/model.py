@@ -3,12 +3,15 @@
 Addresses and channel numbers in this module are zero-based. The live display
 uses the original 20-second sweep. Gaps use the first value of the new packet,
 matching Serial_receive_fcn.m; this is intentionally a backfill rather than
-interpolation. Historical data is retained chronologically in bounded buffers.
+interpolation. Historical data is retained chronologically in NumPy ring buffers.
+Newer packets may overlap earlier packet tails. They replace overlapping samples
+and append only genuinely new timestamps, rather than reproducing MATLAB's
+duplicate historical entries. Counter unwrapping and NaN missing-data semantics
+are independent of rendering and remain unchanged.
 """
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 import csv
 import math
@@ -45,23 +48,30 @@ class AcquisitionModel:
         self.values: dict[tuple[int, int], float] = {}
         self.descriptions: dict[tuple[int, int], str] = {}
         self.slots: list[tuple[int, int] | None] = [None] * self.CHANNELS
+        self.plot_revisions = [0] * self.CHANNELS
         self.clear()
 
     def clear(self):
         """Clear acquisitions while preserving device state and signal selection."""
         self.vplot = np.full((len(self.tm), self.CHANNELS), np.nan)
         self.scope: dict[int, np.ndarray] = {}
-        self._history = [deque(maxlen=self.max_history) for _ in range(self.CHANNELS)]
+        # Absolute display indices map directly into these rings. History is
+        # dense between its retained endpoints because gaps are backfilled.
+        self._history = [np.empty(self.max_history) for _ in range(self.CHANNELS)]
+        self._history_counts = [0] * self.CHANNELS
         self._last_index: list[int | None] = [None] * self.CHANNELS
         self._last_tick: list[int | None] = [None] * self.CHANNELS
         self._tick_time: list[int | None] = [None] * self.CHANNELS
+        for channel in range(self.CHANNELS):
+            self.plot_revisions[channel] += 1
 
     def _clear_channel(self, channel: int):
         self.vplot[:, channel] = np.nan
-        self._history[channel].clear()
+        self._history_counts[channel] = 0
         self._last_index[channel] = None
         self._last_tick[channel] = None
         self._tick_time[channel] = None
+        self.plot_revisions[channel] += 1
 
     def select_signal(self, row: int, column: int, enabled: bool = True):
         """Allocate the first free slot and return firmware routing commands.
@@ -114,7 +124,10 @@ class AcquisitionModel:
                 self.values[event.row, column] = float(value)
             return True
         if isinstance(event, Description):
-            self.descriptions[event.row, event.column] = event.text
+            address = (event.row, event.column)
+            if self.descriptions.get(address) != event.text and address in self.slots:
+                self.plot_revisions[self.slots.index(address)] += 1
+            self.descriptions[address] = event.text
             return True
         if isinstance(event, ScopeSamples):
             if 0 <= event.channel <= self.CHANNELS:
@@ -126,7 +139,7 @@ class AcquisitionModel:
         return False
 
     def _plot_samples(self, channel, values, tick):
-        if not 0 <= channel < self.CHANNELS or self.slots[channel] is None or not values:
+        if not 0 <= channel < self.CHANNELS or self.slots[channel] is None or not len(values):
             return False
         raw_tick = int(tick) & 0xffffffff
         previous_tick = self._last_tick[channel]
@@ -142,44 +155,54 @@ class AcquisitionModel:
         scaled_tick = tick_time * (self.sample_period / self.step)
         target = math.floor(scaled_tick + max(1e-7, math.ulp(scaled_tick)))
         last = self._last_index[channel]
-        if last is not None and target < last:
-            return False
-        first = float(values[0])
-        start = target if last is None else last + 1
-        # A large tick jump cannot allocate unbounded intermediate samples.
-        start = max(start, target - max(self.max_history, self._buckets) + 1)
-        for index in range(start, target + 1):
-            self._store(channel, index, first)
-        if last == target:
-            self._store(channel, target, first)
-        for offset, value in enumerate(values[1:], 1):
-            self._store(channel, target + offset, float(value))
-        self._last_index[channel] = target + len(values) - 1
+        packet = np.asarray(values, dtype=float)
+        end = target + len(packet) - 1
+        highwater = end if last is None else max(last, end)
+        if last is not None and target > last + 1:
+            # Fill only retained positions, using array slices even when the
+            # elapsed gap spans millions of sample buckets.
+            self._write_run(channel, last + 1, float(packet[0]), target - last - 1,
+                            highwater)
+        self._write_run(channel, target, packet, len(packet), highwater)
+        added = len(packet) if last is None else max(0, highwater - last)
+        self._history_counts[channel] = min(self.max_history,
+                                            self._history_counts[channel] + added)
+        self._last_index[channel] = highwater
+        self.plot_revisions[channel] += 1
         return True
 
-    def _store(self, channel, index, value):
-        position = index % self._buckets
-        self.vplot[position, channel] = value
-        if position == 0:
-            self.vplot[-1, channel] = value
-        history = self._history[channel]
-        point = (index * self.step, value)
-        if history and math.isclose(history[-1][0], point[0], rel_tol=0, abs_tol=1e-9):
-            history[-1] = point
-        else:
-            history.append(point)
+    def _write_run(self, channel, start, values, count, highwater):
+        """Write a contiguous scalar/array run to the live and historical rings."""
+        for destination in (self.vplot[:-1, channel], self._history[channel]):
+            # An overlap older than the retained sweep must not overwrite a
+            # newer point that happens to have the same modular position.
+            skip = max(0, highwater - len(destination) + 1 - start)
+            retained = count - skip
+            if retained <= 0:
+                continue
+            position = (start + skip) % len(destination)
+            first = min(retained, len(destination) - position)
+            if np.isscalar(values):
+                destination[position:position + first] = values
+                destination[:retained - first] = values
+            else:
+                destination[position:position + first] = values[skip:skip + first]
+                destination[:retained - first] = values[skip + first:count]
+        self.vplot[-1, channel] = self.vplot[0, channel]
 
     def plot_data(self, channel: int):
         return self.tm, self.vplot[:, channel]
 
     def history_data(self, channel: int):
-        data = np.asarray(self._history[channel], dtype=float)
-        if not data.size:
+        count = self._history_counts[channel]
+        if not count:
             return np.empty(0), np.empty(0)
-        return data[:, 0].copy(), data[:, 1].copy()
+        end = self._last_index[channel]
+        indices = np.arange(end - count + 1, end + 1, dtype=np.int64)
+        return indices * self.step, self._history[channel][indices % self.max_history]
 
     def _recording_arrays(self):
-        lengths = np.asarray([len(h) for h in self._history], dtype=np.int32)
+        lengths = np.asarray(self._history_counts, dtype=np.int32)
         size = int(lengths.max(initial=0))
         memory = np.full((size, self.CHANNELS), np.nan)
         actual_times = np.full_like(memory, np.nan)
@@ -228,9 +251,9 @@ class AcquisitionModel:
         with Path(path).open("w", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream)
             writer.writerow(("time_s", "channel", "row", "column", "label", "value"))
-            for channel, history in enumerate(self._history):
+            for channel in range(self.CHANNELS):
                 address = self.slots[channel] or (-1, -1)
-                for timestamp, value in history:
+                for timestamp, value in zip(*self.history_data(channel)):
                     writer.writerow((format(timestamp, ".12g"), channel + 1,
                                      *address, self.label(channel), format(value, ".12g")))
 

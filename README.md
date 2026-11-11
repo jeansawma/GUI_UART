@@ -1,8 +1,10 @@
-# GUI UART — Python desktop application
+# JS — UART control and acquisition
 
-A Python replacement for the supplied MATLAB GUIDE UART interface, built with Qt. It keeps the original device commands, editable control groups, live plots, and recording workflow in one desktop window. The 19 original MATLAB files are preserved in [`legacy/matlab`](legacy/matlab).
+JS is a Python replacement for the supplied MATLAB GUIDE UART interface, built with Qt. It keeps the original device commands, editable control groups, live plots, and recording workflow in one desktop window. The 19 original MATLAB files are preserved in [`legacy/matlab`](legacy/matlab).
 
-![UART Studio running with simulated data](docs/preview.png)
+![JS running with simulated data](docs/preview.png)
+
+The application is named **JS**. The GitHub repository remains `jeansawma/GUI_UART`, and the internal Python package remains `uart_gui`, so existing download links and launch commands continue to work.
 
 ## Run
 
@@ -46,7 +48,7 @@ python -m pip install -e '.[dev]'
 python -m uart_gui
 ```
 
-`python main.py` is an alternative launcher. To explore without a serial device:
+`python main.py` is an alternative launcher. After installation, `js` also starts the app; the earlier `uart-studio` command remains available. To explore without a serial device:
 
 ```bash
 python -m uart_gui --demo
@@ -66,6 +68,14 @@ Connecting and loading descriptions do not start the device’s W, I, or identif
 
 Use the app on the computer that can access the serial port. A USB device connected to your laptop is not automatically available inside a cloud environment. On Linux, serial access may require membership in `dialout` (or the distribution’s serial-device group); sign out and back in after changing group membership. Windows uses COM ports, and macOS typically exposes `/dev/cu.*` devices.
 
+## Live plotting
+
+The live plot refreshes at **20 Hz** by default. Choose 5, 10, 20, or 30 Hz from the plot’s refresh menu; 5 Hz matches the original MATLAB refresh timer. This changes screen updates independently of the serial baud rate and the device’s sample timing. The defaults remain 115200 baud, a 10 ms display sample step, and a 20-second sweep.
+
+JS redraws changed channels and limits receive processing per GUI turn so controls remain responsive during acquisition. **Pause plot** pauses drawing while recording continues. The status bar shows pending and dropped events when checking a busy connection.
+
+The display sample divider is initialized when valid device timing arrives, including the default sample period. If the device changes its sample period, JS clears the live sweep and history so the new clock starts a separate acquisition; raw scope data is retained.
+
 ## Validate
 
 ```bash
@@ -80,4 +90,4 @@ QT_QPA_PLATFORM=offscreen python -m pytest
 
 Tests exercise the Python implementation using synthetic data and simulated serial I/O. Hardware compatibility still requires a connected device: no firmware source, device capture, or physical UART hardware was supplied. The packet format was recovered from the MATLAB source; see [`docs/MIGRATION.md`](docs/MIGRATION.md) for the compatibility map and protocol details.
 
-The conversion passed **45 automated tests**, including Qt interactions and a pyserial pseudoterminal integration test. See [`docs/VALIDATION.md`](docs/VALIDATION.md) for the tested environment.
+See [`docs/VALIDATION.md`](docs/VALIDATION.md) for the tested environment, automated checks, and performance measurements.

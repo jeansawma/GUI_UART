@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title UART Studio
+title JS
 
 rem Run from the project folder even when launched by double-clicking.
 pushd "%~dp0"
@@ -9,7 +9,7 @@ if errorlevel 1 goto location_error
 set "UART_PYTHON=%~dp0.venv\Scripts\python.exe"
 if exist "%UART_PYTHON%" goto check_environment
 
-echo Preparing the Python environment for UART Studio...
+echo Preparing the Python environment for JS...
 rem Prefer the Windows Python launcher; fall back to Python on PATH.
 py -3 -c "import sys; raise SystemExit(sys.version_info < (3, 10))" >nul 2>&1
 if errorlevel 1 goto try_python
@@ -37,7 +37,7 @@ echo An Internet connection is needed for this step.
 if errorlevel 1 goto install_error
 
 :launch
-echo Starting UART Studio...
+echo Starting JS...
 rem Forward options, for example: run.bat --demo
 "%UART_PYTHON%" "%~dp0main.py" %*
 set "UART_EXIT_CODE=%ERRORLEVEL%"
@@ -70,7 +70,7 @@ goto failure
 
 :application_error
 echo.
-echo UART Studio exited with code %UART_EXIT_CODE%. Review the error above.
+echo JS exited with code %UART_EXIT_CODE%. Review the error above.
 
 :failure
 echo.

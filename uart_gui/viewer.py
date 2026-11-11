@@ -1,4 +1,4 @@
-"""Offline analysis of UART Studio CSV and legacy MATLAB recordings."""
+"""Offline analysis of JS CSV and legacy MATLAB recordings."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class RecordingViewer(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Recording analysis · UART Studio")
+        self.setWindowTitle("Recording analysis · JS")
         self.resize(1120, 720)
         self.setMinimumSize(760, 520)
         self.recording: Recording | None = None
